@@ -27,7 +27,7 @@ The application has three main tabs:
    - Paste an existing Base64-encoded key shared by your contact
 
 ### Key Sharing (Critical Security Step)
-**IMPORTANT**: You must share encryption keys securely with your contacts through a separate, secure channel such as:
+You must share encryption keys securely with your contacts through a separate, secure channel such as:
 - In-person exchange
 - Secure file sharing service
 - Encrypted email
