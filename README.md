@@ -12,7 +12,7 @@ AES-GCM (Advanced Encryption Standard - Galois Counter Mode) is a state-of-the-a
 
 ## Using the Tool
 
-### Interface Overview
+### Interface
 The application has three main tabs:
 1. **Recipients** - Manage your encryption partners
 2. **Encrypt Message** - Create messages to send
