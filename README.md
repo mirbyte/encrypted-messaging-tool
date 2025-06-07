@@ -3,16 +3,7 @@
 ## Overview
 Simple Python-based messaging tool for secure communications. It leverages military-grade AES-256-GCM encryption. Please note, this tool is provided mainly for demonstration and testing purposes; you should not rely on it if you don't fully understand the code.
 
-## What is AES-GCM Encryption?
-AES-GCM (Advanced Encryption Standard - Galois Counter Mode) is a state-of-the-art encryption method and the standard used by:
-- HTTPS web connections
-- VPN protocols
-- Government and military communications
-- Modern secure messaging apps
-
-## Using the Tool
-
-### Interface
+## Usage
 The application has three main tabs:
 1. **Recipients** - Manage your encryption partners
 2. **Encrypt Message** - Create messages to send
