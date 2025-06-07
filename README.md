@@ -3,6 +3,13 @@
 ## Overview
 Simple Python-based messaging tool for secure communications. It leverages military-grade AES-256-GCM encryption. Please note, this tool is provided mainly for demonstration and testing purposes; you should not rely on it if you don't fully understand the code.
 
+<br>
+
+
+![gui](https://github.com/user-attachments/assets/de845922-6912-4837-9c5d-c8168fde3377)
+
+
+
 ## Usage
 The application has three main tabs:
 1. **Recipients** - Manage your encryption partners
