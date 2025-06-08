@@ -11,11 +11,12 @@ Simple Python-based messaging tool for secure communications. It leverages milit
 
 
 ## Usage
-The application has three main tabs:
+The application has four main tabs:
 1. **Recipients** - Manage your encryption partners
 2. **Encrypt Message** - Create messages to send
 3. **Decrypt Message** - Decrypt messages you receive
-
+4. **Configuration** - Settings
+ 
 ### Adding a New Recipient
 1. Click the **Recipients** tab
 2. Click **"Add New Recipient"**
