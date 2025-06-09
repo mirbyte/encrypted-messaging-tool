@@ -78,7 +78,7 @@ class InputSanitizer:
         # Remove HTML tags and escape special characters
         name = html.escape(name.strip())
         
-        # Remove potentially dangerous characters
+        # Remove potentially problematic characters
         dangerous_chars = r'[<>:"/\\|?*\x00-\x1f]'
         name = re.sub(dangerous_chars, '', name)
         
