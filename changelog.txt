@@ -1,0 +1,5 @@
+v0.3 - first public release
+v0.4 - Password related improvements, including bruteforce protection
+
+
+Current known issues: failed password attempts not calculated properly.
