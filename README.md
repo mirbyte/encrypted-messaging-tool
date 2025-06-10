@@ -1,3 +1,8 @@
+[![License](https://img.shields.io/github/license/mirbyte/encrypted-messaging-tool?color=555555)](https://raw.githubusercontent.com/mirbyte/encrypted-messaging-tool/master/LICENSE)
+![Size](https://img.shields.io/github/repo-size/mirbyte/encrypted-messaging-tool?label=size&color=555555)
+[![Updated](https://img.shields.io/github/last-commit/mirbyte/encrypted-messaging-tool?color=555555&label=updated)](https://github.com/mirbyte/encrypted-messaging-tool/commits/main)
+
+
 # Encrypted Messaging Tool (AES-256)
 
 ## Overview
