@@ -1644,7 +1644,7 @@ class E2EMessagingTool:
             encrypted_data = nonce + ciphertext + tag
             encrypted_b64 = base64.b64encode(encrypted_data).decode('utf-8')
 
-            formatted_output = f"-----BEGIN ENCRYPTED MESSAGE-----\n{encrypted_b64}\n-----END ENCRYPTED MESSAGE-----"
+            formatted_output = f"-----BEGIN EMT MESSAGE-----\n{encrypted_b64}\n-----END EMT MESSAGE-----"
 
             # Display result
             self.encrypted_output.config(state='normal')
@@ -1671,7 +1671,7 @@ class E2EMessagingTool:
 
         try:
             # Extract the base64 payload - only support current format
-            if encrypted_text_full.startswith("-----BEGIN ENCRYPTED MESSAGE-----"):
+            if encrypted_text_full.startswith("-----BEGIN EMT MESSAGE-----"):
                 lines = encrypted_text_full.split('\n')
                 encrypted_text = '\n'.join(lines[1:-1]).strip()
             else:
