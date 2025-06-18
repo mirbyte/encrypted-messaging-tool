@@ -13,6 +13,7 @@ import secrets
 import re
 import html
 import hashlib
+import time
 from configparser import ConfigParser
 
 # --- DPI Awareness ---
@@ -36,6 +37,9 @@ PBKDF2_ITERATIONS = 100000
 SALT_SIZE = 32
 MAX_RECIPIENT_NAME_LENGTH = 50
 MAX_MESSAGE_LENGTH = 1000000
+
+# Password verification constants
+PASSWORD_VERIFICATION_DATA = b"MASTER_PASSWORD_VERIFICATION_TOKEN"
 
 class SecureMemory:
     """Utility class for secure memory operations"""
@@ -64,9 +68,7 @@ class SecureMemory:
         """Create a secure bytearray for sensitive data"""
         return bytearray(size)
 
-
 class InputSanitizer:
-    """Utility class for input sanitization"""
     @staticmethod
     def sanitize_recipient_name(name):
         """Sanitize recipient name input"""
@@ -76,7 +78,7 @@ class InputSanitizer:
         # Remove HTML tags and escape special characters
         name = html.escape(name.strip())
         
-        # Remove potentially dangerous characters
+        # Remove potentially problematic characters
         dangerous_chars = r'[<>:"/\\|?*\x00-\x1f]'
         name = re.sub(dangerous_chars, '', name)
         
@@ -238,15 +240,229 @@ class UIConfig:
         self.parser.set(section, key, str(value))
         self.save_config()
 
+class SecurityManager:
+    def __init__(self, app_instance):
+        self.app = app_instance  # Reference to main app for encryption
+        self.max_attempts = 5
+        self.base_lockout_minutes = 5
+        self.max_lockout_hours = 24
+        self.rapid_attempt_threshold = 3  # seconds
+        
+        # Default security config
+        self.default_security_config = {
+            'failed_attempts': 0,
+            'last_attempt_time': 0,
+            'lockout_until': 0,
+            'total_lockouts': 0
+        }
+        
+        self.security_config = self.default_security_config.copy()
+    
+    def encrypt_security_data(self, data):
+        if not self.app.master_key or all(b == 0 for b in self.app.master_key):
+            raise ValueError("Master key not initialized for security data encryption")
+            
+        # Convert to JSON string
+        json_string = json.dumps(data, indent=2)
+        plaintext = json_string.encode('utf-8')
+        
+        # Generate random nonce
+        nonce = secrets.token_bytes(GCM_NONCE_SIZE)
+        
+        try:
+            # Create cipher and encrypt
+            cipher = Cipher(
+                algorithms.AES(bytes(self.app.master_key)),
+                modes.GCM(nonce),
+                backend=default_backend()
+            )
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(plaintext) + encryptor.finalize()
+            
+            # Combine nonce + ciphertext + tag
+            encrypted_data = nonce + ciphertext + encryptor.tag
+            return base64.b64encode(encrypted_data).decode('utf-8')
+        finally:
+            # Secure cleanup
+            SecureMemory.secure_clear(plaintext)
+    
+    def decrypt_security_data(self, encrypted_data):
+        """Decrypt security data using master key"""
+        if not encrypted_data:
+            raise ValueError("No security data provided")
+            
+        if not self.app.master_key or all(b == 0 for b in self.app.master_key):
+            raise ValueError("Master key not initialized for security data decryption")
+            
+        try:
+            # Decode from base64
+            encrypted_bytes = base64.b64decode(encrypted_data)
+            
+            # Extract components
+            nonce = encrypted_bytes[:GCM_NONCE_SIZE]
+            tag = encrypted_bytes[-GCM_TAG_SIZE:]
+            ciphertext = encrypted_bytes[GCM_NONCE_SIZE:-GCM_TAG_SIZE]
+            
+            # Create cipher and decrypt
+            cipher = Cipher(
+                algorithms.AES(bytes(self.app.master_key)),
+                modes.GCM(nonce, tag),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            # Parse JSON
+            json_string = plaintext.decode('utf-8')
+            result = json.loads(json_string)
+            
+            # Secure cleanup
+            SecureMemory.secure_clear(plaintext)
+            
+            # Ensure all required keys exist
+            for key, value in self.default_security_config.items():
+                if key not in result:
+                    result[key] = value
+            
+            return result
+            
+        except Exception as e:
+            # DO NOT FALLBACK - raise the exception to indicate wrong password
+            raise ValueError(f"Failed to decrypt security data (likely wrong password): {str(e)}")
+    
+    def load_security_config(self):
+        config = self.app.load_config()
+        security_data = config.get('security_data', '')
+        
+        if not security_data:
+            # No security data exists yet - use defaults for new setup
+            self.security_config = self.default_security_config.copy()
+            return
+            
+        # Try to decrypt - this will raise exception if password is wrong
+        self.security_config = self.decrypt_security_data(security_data)
+    
+    def save_security_config(self):
+        config = self.app.load_config()
+        config['security_data'] = self.encrypt_security_data(self.security_config)
+        self.app.save_config(config)
+    
+    def is_locked_out(self):
+        current_time = time.time()
+        return current_time < self.security_config['lockout_until']
+    
+    def get_lockout_remaining(self):
+        current_time = time.time()
+        remaining = self.security_config['lockout_until'] - current_time
+        return max(0, remaining)
+    
+    def record_failed_attempt(self):
+        current_time = time.time()
+        # Check for rapid attempts
+        time_since_last = current_time - self.security_config['last_attempt_time']
+        if time_since_last < self.rapid_attempt_threshold:
+            # Penalize rapid attempts more severely
+            self.security_config['failed_attempts'] += 2
+        else:
+            self.security_config['failed_attempts'] += 1
+        
+        self.security_config['last_attempt_time'] = current_time
+        
+        # Calculate lockout if exceeded max attempts
+        if self.security_config['failed_attempts'] >= self.max_attempts:
+            self.apply_lockout()
+        
+        self.save_security_config()
+    
+    def apply_lockout(self):
+        """Apply lockout based on previous violations"""
+        current_time = time.time()
+        
+        # Progressive lockout: base_time * (2 ^ total_lockouts)
+        lockout_minutes = min(
+            self.base_lockout_minutes * (2 ** self.security_config['total_lockouts']),
+            self.max_lockout_hours * 60
+        )
+        
+        self.security_config['lockout_until'] = current_time + (lockout_minutes * 60)
+        self.security_config['total_lockouts'] += 1
+        self.security_config['failed_attempts'] = 0  # Reset for next cycle
+        
+        self.save_security_config()
+    
+    def record_successful_attempt(self):
+        """Record successful password entry"""
+        # Reset failed attempts but keep lockout history
+        self.security_config['failed_attempts'] = 0
+        self.security_config['last_attempt_time'] = 0
+        self.save_security_config()
+    
+    def get_attempts_remaining(self):
+        """Get number of attempts remaining before lockout"""
+        return max(0, self.max_attempts - self.security_config['failed_attempts'])
+    
+    def reset_security_data(self):
+        """Reset all security data (admin function)"""
+        self.security_config = self.default_security_config.copy()
+        self.save_security_config()
+    
+    def get_security_status(self):
+        """Get current security status for display"""
+        if self.is_locked_out():
+            remaining = self.get_lockout_remaining()
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            seconds = int(remaining % 60)
+            
+            if hours > 0:
+                time_str = f"{hours}h {minutes}m {seconds}s"
+            elif minutes > 0:
+                time_str = f"{minutes}m {seconds}s"
+            else:
+                time_str = f"{seconds}s"
+            
+            return f"LOCKED OUT - {time_str} remaining"
+        
+        attempts_left = self.get_attempts_remaining()
+        if attempts_left < self.max_attempts:
+            return f"Warning: {attempts_left} attempts remaining"
+        
+        return "Ready"
 
 class MasterPasswordDialog(Dialog):
-    def __init__(self, parent, title, is_first_time=False, ui_config=None):
+    def __init__(self, parent, title, is_first_time=False, ui_config=None, security_manager=None):
         self.is_first_time = is_first_time
         self.password = None
         self.reset_requested = False
         self.parent = parent
         self.ui_config = ui_config or UIConfig()
+        self.security_manager = security_manager
         self.style = ttk.Style(parent)
+        
+        # Check lockout status before showing dialog
+        if not is_first_time and self.security_manager and self.security_manager.is_locked_out():
+            remaining = self.security_manager.get_lockout_remaining()
+            hours = int(remaining // 3600)
+            minutes = int((remaining % 3600) // 60)
+            seconds = int(remaining % 60)
+            
+            if hours > 0:
+                time_str = f"{hours} hours, {minutes} minutes, {seconds} seconds"
+            elif minutes > 0:
+                time_str = f"{minutes} minutes, {seconds} seconds"
+            else:
+                time_str = f"{seconds} seconds"
+            
+            messagebox.showerror(
+                "Account Locked", 
+                f"Too many failed password attempts.\n\n"
+                f"Access is locked for: {time_str}\n\n"
+                f"Please wait before trying again.",
+                parent=parent
+            )
+            self.password = None
+            return
+        
         super().__init__(parent, title)
 
     def body(self, master):
@@ -256,36 +472,84 @@ class MasterPasswordDialog(Dialog):
         
         master.configure(bg=dark_bg)
         
+        # Security status display
+        if not self.is_first_time and self.security_manager:
+            status = self.security_manager.get_security_status()
+            attempts_remaining = self.security_manager.get_attempts_remaining()
+            
+            if "Warning" in status or "LOCKED" in status:
+                color = self.ui_config.get('colors', 'error_color')
+            else:
+                color = self.ui_config.get('colors', 'success_color')
+            
+            status_label = ttk.Label(master, text=f"Security Status: {status}", 
+                                   background=dark_bg, foreground=color)
+            status_label.grid(row=0, column=0, columnspan=2, padx=5, pady=5, sticky='ew')
+        
+        row_offset = 1 if not self.is_first_time and self.security_manager else 0
+        
         if self.is_first_time:
             ttk.Label(master, text="Create Master Password:", 
-                     background=dark_bg, foreground=light_fg).grid(row=0, column=0, padx=5, pady=5, sticky='w')
+                     background=dark_bg, foreground=light_fg).grid(row=row_offset, column=0, padx=5, pady=5, sticky='w')
             self.password_entry = ttk.Entry(master, width=entry_width, show='*')
-            self.password_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+            self.password_entry.grid(row=row_offset, column=1, padx=5, pady=5, sticky='ew')
             
             ttk.Label(master, text="Confirm Password:", 
-                     background=dark_bg, foreground=light_fg).grid(row=1, column=0, padx=5, pady=5, sticky='w')
+                     background=dark_bg, foreground=light_fg).grid(row=row_offset+1, column=0, padx=5, pady=5, sticky='w')
             self.confirm_entry = ttk.Entry(master, width=entry_width, show='*')
-            self.confirm_entry.grid(row=1, column=1, padx=5, pady=5, sticky='ew')
+            self.confirm_entry.grid(row=row_offset+1, column=1, padx=5, pady=5, sticky='ew')
         else:
             ttk.Label(master, text="Enter Master Password:", 
-                     background=dark_bg, foreground=light_fg).grid(row=0, column=0, padx=5, pady=5, sticky='w')
+                     background=dark_bg, foreground=light_fg).grid(row=row_offset, column=0, padx=5, pady=5, sticky='w')
             self.password_entry = ttk.Entry(master, width=entry_width, show='*')
-            self.password_entry.grid(row=0, column=1, padx=5, pady=5, sticky='ew')
+            self.password_entry.grid(row=row_offset, column=1, padx=5, pady=5, sticky='ew')
             
-            reset_btn = ttk.Button(master, text="Reset App", command=self.reset_app)
-            reset_btn.grid(row=1, column=0, columnspan=2, padx=5, pady=10)
+            button_frame = ttk.Frame(master)
+            button_frame.grid(row=row_offset+1, column=0, columnspan=2, padx=5, pady=10)
+            
+            reset_btn = ttk.Button(button_frame, text="Reset App", command=self.reset_app)
+            reset_btn.pack(side='left', padx=5)
+            
+            if self.security_manager and self.security_manager.security_config['total_lockouts'] > 0:
+                unlock_btn = ttk.Button(button_frame, text="Emergency Unlock", command=self.emergency_unlock)
+                unlock_btn.pack(side='left', padx=5)
 
         master.columnconfigure(1, weight=1)
         return self.password_entry
 
+    def emergency_unlock(self):
+        """Emergency unlock with strong warning"""
+        result = messagebox.askyesnocancel(
+            "Emergency Unlock",
+            "⚠️  SECURITY WARNING  ⚠️\n\n"
+            "This will reset ALL security lockouts and attempt counters.\n"
+            "Only use this if you are certain you are the legitimate user.\n\n"
+            "Continue with emergency unlock?",
+            parent=self.parent
+        )
+        
+        if result:
+            # Require confirmation of app reset
+            confirm = messagebox.askyesno(
+                "Confirm Emergency Action",
+                "Emergency unlock will also reset the entire application.\n"
+                "This is a security measure. Continue?",
+                parent=self.parent
+            )
+            
+            if confirm:
+                self.security_manager.reset_security_data()
+                self.reset_requested = True
+                self.destroy()
 
     def reset_app(self):
         if messagebox.askyesno("Reset Application", 
                               "This will delete ALL data including recipients and reset the app to default state.\n\nAre you sure?", 
                               parent=self.parent):
+            if self.security_manager:
+                self.security_manager.reset_security_data()
             self.reset_requested = True
             self.destroy()
-
 
     def validate(self):
         if self.is_first_time:
@@ -296,7 +560,7 @@ class MasterPasswordDialog(Dialog):
                 messagebox.showwarning("Validation", "Password is required", parent=self.parent)
                 return False
             
-            if len(password) < 4:
+            if len(password) < 4:  # Keep minimum at 4 characters
                 messagebox.showwarning("Validation", "Password must be at least 4 characters long", parent=self.parent)
                 return False
                 
@@ -312,7 +576,6 @@ class MasterPasswordDialog(Dialog):
                 return False
                 
         return True
-
 
     def apply(self):
         pass
@@ -360,7 +623,6 @@ class RecipientDialog(Dialog):
         master.columnconfigure(1, weight=1)
         master.rowconfigure(1, weight=1)
         return self.name_entry
-
 
     def validate_name_realtime(self, event=None):
         name = self.name_entry.get()
@@ -451,7 +713,7 @@ class E2EMessagingTool:
         # Configure window
         width = self.ui_config.getint('geometry', 'window_width')
         height = self.ui_config.getint('geometry', 'window_height')
-        self.root.title("Encrypted Messaging Tool (AES-GCM) v0.3")
+        self.root.title("Encrypted Messaging Tool (AES-GCM) v0.4")
         self.root.geometry(f"{width}x{height}")
         self.root.resizable(True, True)
         
@@ -459,6 +721,10 @@ class E2EMessagingTool:
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
         
         self.config_file = "config.json"
+        
+        # Initialize security manager (needs app reference for encryption)
+        self.security_manager = SecurityManager(self)
+        
         self.apply_dark_theme()
         
         # Initialize master key for recipients encryption
@@ -492,78 +758,49 @@ class E2EMessagingTool:
         if hasattr(self, 'current_decryption_key') and self.current_decryption_key:
             SecureMemory.secure_clear(self.current_decryption_key)
 
-    def setup_ui(self):
-        padding = self.ui_config.getint('geometry', 'button_padding')
+    def encrypt_password_verification_data(self, master_key):
+        """Create encrypted verification data for password checking"""
+        # Generate random nonce
+        nonce = secrets.token_bytes(GCM_NONCE_SIZE)
         
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill='both', expand=True, padx=padding*2, pady=padding*2)
+        # Create cipher and encrypt the verification token
+        cipher = Cipher(
+            algorithms.AES(bytes(master_key)),
+            modes.GCM(nonce),
+            backend=default_backend()
+        )
+        encryptor = cipher.encryptor()
+        ciphertext = encryptor.update(PASSWORD_VERIFICATION_DATA) + encryptor.finalize()
+        
+        # Combine nonce + ciphertext + tag
+        encrypted_data = nonce + ciphertext + encryptor.tag
+        return base64.b64encode(encrypted_data).decode('utf-8')
 
-        self.recipient_tab = ttk.Frame(self.notebook)
-        self.encrypt_tab = ttk.Frame(self.notebook)
-        self.decrypt_tab = ttk.Frame(self.notebook)
-        self.config_tab = ttk.Frame(self.notebook)
-
-        self.notebook.add(self.encrypt_tab, text="Encrypt Message")
-        self.notebook.add(self.decrypt_tab, text="Decrypt Message")
-        self.notebook.add(self.recipient_tab, text="Recipients")
-        self.notebook.add(self.config_tab, text="Configuration")
-
-        self.setup_recipient_tab()
-        self.setup_encryption_tab()
-        self.setup_decryption_tab()
-        self.setup_config_tab()
-        self.populate_recipient_list()
-
-    def setup_config_tab(self):
-        padding = self.ui_config.getint('geometry', 'button_padding')
-        
-        config_frame = ttk.LabelFrame(self.config_tab, text="Security Settings")
-        config_frame.pack(fill='x', padx=padding*2, pady=padding)
-        
-        ttk.Button(config_frame, text="Change Master Password",
-                   command=self.change_master_password).pack(side='left', padx=padding)
-        
-        ttk.Button(config_frame, text="Reset Application",
-                   command=self.reset_application_data).pack(side='left', padx=padding)
-        
-        # Memory cleanup
-        memory_frame = ttk.LabelFrame(self.config_tab, text="Memory Management")
-        memory_frame.pack(fill='x', padx=padding*2, pady=padding)
-        
-        ttk.Button(memory_frame, text="Clear Sensitive Memory",
-                   command=self.manual_memory_cleanup).pack(side='left', padx=padding)
-        
-        # UI settings
-        ui_frame = ttk.LabelFrame(self.config_tab, text="UI Configuration")
-        ui_frame.pack(fill='both', expand=True, padx=padding*2, pady=padding)
-        
-        ttk.Label(ui_frame, text="UI settings are stored in ui_config.ini").pack(padx=padding, pady=padding)
-        ttk.Button(ui_frame, text="Reset UI to Defaults",
-                   command=self.reset_ui_config).pack(padx=padding, pady=padding)
-
-    def manual_memory_cleanup(self):
-        self.secure_cleanup()
-        messagebox.showinfo("Memory Cleanup", "Sensitive memory has been cleared")
-
-    def reset_ui_config(self):
-        """Reset UI configuration to defaults"""
-        if os.path.exists(self.ui_config.config_file):
-            os.remove(self.ui_config.config_file)
-        messagebox.showinfo("UI Reset", "UI configuration reset. Please restart the application.")
-
-    def reset_application_data(self):
-        """Reset application to default state by removing all data files"""
-        if messagebox.askyesno("Reset Application", 
-                              "This will delete ALL data including recipients and reset the app to default state.\n\nAre you sure?"):
-            self.secure_cleanup()
+    def verify_password_with_verification_data(self, master_key, verification_data):
+        """Verify password by decrypting verification data"""
+        try:
+            # Decode from base64
+            encrypted_bytes = base64.b64decode(verification_data)
             
-            # Remove config files
-            for file in [self.config_file, "recipients.json", "ui_config.ini"]:
-                if os.path.exists(file):
-                    os.remove(file)
+            # Extract components
+            nonce = encrypted_bytes[:GCM_NONCE_SIZE]
+            tag = encrypted_bytes[-GCM_TAG_SIZE:]
+            ciphertext = encrypted_bytes[GCM_NONCE_SIZE:-GCM_TAG_SIZE]
             
-            messagebox.showinfo("Reset Complete", "Application has been reset to default state.\nPlease restart the application.")
-            self.root.destroy()
+            # Create cipher and decrypt
+            cipher = Cipher(
+                algorithms.AES(bytes(master_key)),
+                modes.GCM(nonce, tag),
+                backend=default_backend()
+            )
+            decryptor = cipher.decryptor()
+            plaintext = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            # Check if decrypted data matches expected verification token
+            return plaintext == PASSWORD_VERIFICATION_DATA
+            
+        except Exception:
+            return False
 
     def initialize_master_key(self):
         """Initialize or verify master password for encrypting recipients data"""
@@ -572,7 +809,8 @@ class E2EMessagingTool:
         if 'salt' not in config:
             # First time setup
             dialog = MasterPasswordDialog(self.root, "Setup Master Password", 
-                                        is_first_time=True, ui_config=self.ui_config)
+                                        is_first_time=True, ui_config=self.ui_config,
+                                        security_manager=self.security_manager)
             
             if dialog.reset_requested:
                 self.reset_application_data()
@@ -585,17 +823,37 @@ class E2EMessagingTool:
             # Generate new salt and derive key
             self.salt = secrets.token_bytes(SALT_SIZE)
             config['salt'] = base64.b64encode(self.salt).decode('utf-8')
-            self.save_config(config)
+            
+            # Derive key from password
             self.derive_key_from_password(dialog.password)
+            
+            # Create password verification data
+            config['password_verification'] = self.encrypt_password_verification_data(self.master_key)
+            
+            # Save config
+            self.save_config(config)
+            
+            # Reset security on first setup
+            self.security_manager.reset_security_data()
             
             # Secure cleanup of password
             SecureMemory.secure_clear(dialog.password)
             return True
         else:
-            # Existing setup
+            # Existing setup - verify password using verification data
             self.salt = base64.b64decode(config['salt'])
+            
+            # Check if we have password verification data
+            if 'password_verification' not in config:
+                messagebox.showerror("Corrupted Data", 
+                                   "Password verification data is missing. The application may be corrupted.\n"
+                                   "You may need to reset the application.")
+                return False
+            
+            # Get password from user
             dialog = MasterPasswordDialog(self.root, "Enter Master Password", 
-                                        is_first_time=False, ui_config=self.ui_config)
+                                        is_first_time=False, ui_config=self.ui_config,
+                                        security_manager=None)  # Don't check lockout yet for first load
             
             if dialog.reset_requested:
                 self.reset_application_data()
@@ -603,20 +861,67 @@ class E2EMessagingTool:
                 
             if not dialog.password:
                 return False
-                
+            
+            # Derive key from entered password
             self.derive_key_from_password(dialog.password)
+            
+            # Load security manager without lockout check first
+            try:
+                self.security_manager.load_security_config()
+            except Exception:
+                # If we can't load security config, it might be corrupted or wrong password
+                # But we'll verify with the verification data first
+                pass
+            
+            # Now check lockout status
+            if self.security_manager.is_locked_out():
+                SecureMemory.secure_clear(dialog.password)
+                return False
+            
+            # CRITICAL: Verify password using verification data
+            verification_data = config['password_verification']
+            if not self.verify_password_with_verification_data(self.master_key, verification_data):
+                # Password is incorrect
+                self.security_manager.record_failed_attempt()
+                
+                attempts_remaining = self.security_manager.get_attempts_remaining()
+                if attempts_remaining > 0:
+                    messagebox.showerror(
+                        "Invalid Password", 
+                        f"Incorrect master password.\n\n"
+                        f"Attempts remaining: {attempts_remaining}\n"
+                        f"Account will be locked after {self.security_manager.max_attempts} failed attempts."
+                    )
+                else:
+                    lockout_time = self.security_manager.base_lockout_minutes * (2 ** (self.security_manager.security_config['total_lockouts'] - 1))
+                    lockout_time = min(lockout_time, self.security_manager.max_lockout_hours * 60)
+                    messagebox.showerror(
+                        "Account Locked", 
+                        f"Too many failed attempts.\n\n"
+                        f"Account locked for {lockout_time} minutes.\n"
+                        f"Please wait before trying again."
+                    )
+                
+                SecureMemory.secure_clear(self.master_key)
+                SecureMemory.secure_clear(dialog.password)
+                return False
+            
+            # Password is correct - record success and load security config properly
+            self.security_manager.record_successful_attempt()
+            
+            # Now load security config with correct key
+            try:
+                self.security_manager.load_security_config()
+            except Exception as e:
+                # If security config fails to load even with correct password, it might be corrupted
+                messagebox.showwarning("Security Config", 
+                                     f"Security configuration could not be loaded: {str(e)}\n"
+                                     f"Using default security settings.")
+                self.security_manager.security_config = self.security_manager.default_security_config.copy()
             
             # Secure cleanup of password
             SecureMemory.secure_clear(dialog.password)
-            
-            # Verify password by trying to decrypt recipients file
-            try:
-                self.load_recipients()
-                return True
-            except Exception:
-                messagebox.showerror("Invalid Password", "Incorrect master password")
-                SecureMemory.secure_clear(self.master_key)
-                return False
+            return True
 
     def derive_key_from_password(self, password):
         """Derive encryption key from master password using PBKDF2"""
@@ -700,6 +1005,7 @@ class E2EMessagingTool:
             return result
             
         except Exception as e:
+            # DO NOT FALLBACK - raise the exception to indicate decryption failure
             raise ValueError(f"Failed to decrypt recipients data: {str(e)}")
 
     def change_master_password(self):
@@ -708,8 +1014,15 @@ class E2EMessagingTool:
                                    show='*', parent=self.root)
         if not current_password:
             return
-            
-        # Verify current password
+        
+        # Verify current password using verification data
+        config = self.load_config()
+        if 'password_verification' not in config:
+            messagebox.showerror("Error", "Password verification data missing")
+            SecureMemory.secure_clear(current_password)
+            return
+        
+        # Derive key from current password
         test_key = SecureMemory.create_secure_bytes(AES_KEY_SIZE)
         try:
             kdf = PBKDF2HMAC(
@@ -722,7 +1035,8 @@ class E2EMessagingTool:
             derived_key = kdf.derive(current_password.encode('utf-8'))
             test_key[:] = derived_key
             
-            if bytes(test_key) != bytes(self.master_key):
+            # Verify using verification data
+            if not self.verify_password_with_verification_data(test_key, config['password_verification']):
                 messagebox.showerror("Invalid", "Current password is incorrect")
                 return
                 
@@ -731,10 +1045,10 @@ class E2EMessagingTool:
             SecureMemory.secure_clear(current_password)
             
         new_password = askstring("New Password", 
-                               "Enter new master password (min 8 chars):", 
+                               "Enter new master password (min 4 chars):", 
                                show='*', parent=self.root)
-        if not new_password or len(new_password) < 8:
-            messagebox.showerror("Invalid", "New password must be at least 8 characters")
+        if not new_password or len(new_password) < 4:
+            messagebox.showerror("Invalid", "New password must be at least 4 characters")
             return
             
         confirm_password = askstring("Confirm New Password", 
@@ -751,16 +1065,92 @@ class E2EMessagingTool:
             self.salt = secrets.token_bytes(SALT_SIZE)
             self.derive_key_from_password(new_password)
             
-            # Update config and re-encrypt recipients
-            config = self.load_config()
+            # Update config with new salt and verification data
             config['salt'] = base64.b64encode(self.salt).decode('utf-8')
+            config['password_verification'] = self.encrypt_password_verification_data(self.master_key)
             self.save_config(config)
+            
+            # Re-encrypt recipients and security data with new key
             self.save_recipients()
+            self.security_manager.save_security_config()
             
             messagebox.showinfo("Success", "Master password changed successfully")
         finally:
             SecureMemory.secure_clear(new_password)
             SecureMemory.secure_clear(confirm_password)
+
+    def setup_ui(self):
+        padding = self.ui_config.getint('geometry', 'button_padding')
+        
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill='both', expand=True, padx=padding*2, pady=padding*2)
+
+        self.recipient_tab = ttk.Frame(self.notebook)
+        self.encrypt_tab = ttk.Frame(self.notebook)
+        self.decrypt_tab = ttk.Frame(self.notebook)
+        self.config_tab = ttk.Frame(self.notebook)
+
+        self.notebook.add(self.encrypt_tab, text="Encrypt Message")
+        self.notebook.add(self.decrypt_tab, text="Decrypt Message")
+        self.notebook.add(self.recipient_tab, text="Recipients")
+        self.notebook.add(self.config_tab, text="Configuration")
+
+        self.setup_recipient_tab()
+        self.setup_encryption_tab()
+        self.setup_decryption_tab()
+        self.setup_config_tab()
+        self.populate_recipient_list()
+
+    def setup_config_tab(self):
+        padding = self.ui_config.getint('geometry', 'button_padding')
+        
+        config_frame = ttk.LabelFrame(self.config_tab, text="Security Settings")
+        config_frame.pack(fill='x', padx=padding*2, pady=padding)
+        
+        ttk.Button(config_frame, text="Change Master Password",
+                   command=self.change_master_password).pack(side='left', padx=padding)
+        
+        ttk.Button(config_frame, text="Reset Application",
+                   command=self.reset_application_data).pack(side='left', padx=padding)
+        
+        # Memory cleanup
+        memory_frame = ttk.LabelFrame(self.config_tab, text="Memory Management")
+        memory_frame.pack(fill='x', padx=padding*2, pady=padding)
+        
+        ttk.Button(memory_frame, text="Clear Sensitive Memory",
+                   command=self.manual_memory_cleanup).pack(side='left', padx=padding)
+        
+        # UI settings
+        ui_frame = ttk.LabelFrame(self.config_tab, text="UI Configuration")
+        ui_frame.pack(fill='both', expand=True, padx=padding*2, pady=padding)
+        
+        ttk.Label(ui_frame, text="UI settings are stored in ui_config.ini").pack(padx=padding, pady=padding)
+        ttk.Button(ui_frame, text="Reset UI to Defaults",
+                   command=self.reset_ui_config).pack(padx=padding, pady=padding)
+
+    def manual_memory_cleanup(self):
+        self.secure_cleanup()
+        messagebox.showinfo("Memory Cleanup", "Sensitive memory has been cleared")
+
+    def reset_ui_config(self):
+        """Reset UI configuration to defaults"""
+        if os.path.exists(self.ui_config.config_file):
+            os.remove(self.ui_config.config_file)
+        messagebox.showinfo("UI Reset", "UI configuration reset. Please restart the application.")
+
+    def reset_application_data(self):
+        """Reset application to default state by removing all data files"""
+        if messagebox.askyesno("Reset Application", 
+                              "This will delete ALL data including recipients and reset the app to default state.\n\nAre you sure?"):
+            self.secure_cleanup()
+            
+            # Remove config files
+            for file in [self.config_file, "recipients.json", "ui_config.ini"]:
+                if os.path.exists(file):
+                    os.remove(file)
+            
+            messagebox.showinfo("Reset Complete", "Application has been reset to default state.\nPlease restart the application.")
+            self.root.destroy()
 
     def apply_dark_theme(self):
         style = ttk.Style(self.root)
@@ -955,7 +1345,7 @@ class E2EMessagingTool:
                 file_content = f.read().strip()
                 
             if file_content:
-                # Always expect encrypted format
+                # Always expect encrypted format - will raise exception if wrong password
                 self.recipients = self.decrypt_recipients_data(file_content)
             else:
                 self.recipients = []
@@ -1254,7 +1644,7 @@ class E2EMessagingTool:
             encrypted_data = nonce + ciphertext + tag
             encrypted_b64 = base64.b64encode(encrypted_data).decode('utf-8')
 
-            formatted_output = f"-----BEGIN EMT MESSAGE-----\n{encrypted_b64}\n-----END EMT MESSAGE-----"
+            formatted_output = f"-----BEGIN ENCRYPTED MESSAGE-----\n{encrypted_b64}\n-----END ENCRYPTED MESSAGE-----"
 
             # Display result
             self.encrypted_output.config(state='normal')
@@ -1281,7 +1671,7 @@ class E2EMessagingTool:
 
         try:
             # Extract the base64 payload - only support current format
-            if encrypted_text_full.startswith("-----BEGIN EMT MESSAGE-----"):
+            if encrypted_text_full.startswith("-----BEGIN ENCRYPTED MESSAGE-----"):
                 lines = encrypted_text_full.split('\n')
                 encrypted_text = '\n'.join(lines[1:-1]).strip()
             else:
@@ -1350,10 +1740,7 @@ class E2EMessagingTool:
         self.decrypt_status_indicator.config(foreground=self.ui_config.get('colors', 'error_color'))
 
 
-
-
 if __name__ == "__main__":
     root = tk.Tk()
     app = E2EMessagingTool(root)
     root.mainloop()
-
