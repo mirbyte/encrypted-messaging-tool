@@ -1,5 +1,6 @@
 v0.3 - first public release
 v0.4 - Password related improvements, including bruteforce protection
+v0.5 - Paste clipboard button & auto recipient load features added
 
 
 Current known issues: failed password attempts not calculated properly.
