@@ -6,7 +6,7 @@
 # Encrypted Messaging Tool (AES-256)
 
 ## Overview
-Simple Python-based messaging tool for secure communications. It leverages military-grade AES-256-GCM encryption. Please note, this tool is provided mainly for demonstration and testing purposes; you should not rely on it if you don't fully understand the code.
+Simple Python-based messaging tool for secure communications. It leverages military-grade AES-256-GCM encryption. Please note, this tool is provided mainly for demonstration and testing purposes; you should not rely on it if you don't fully understand the code and functionality.
 
 <br>
 
